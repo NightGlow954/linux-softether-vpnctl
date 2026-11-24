@@ -1,6 +1,6 @@
 #!/bin/bash
 # SoftEther VPN Client 控制脚本
-# Version 2.0
+# Version 2.1
 # 用法:
 #   ./vpn-ctl.sh                                        # 列出账户
 #   ./vpn-ctl.sh <账户名> connect|c                     # 连接
@@ -182,35 +182,83 @@ case "$ACTION" in
             echo "    已清理自动生成连接: $con"
         done < <(nmcli -t -f NAME,DEVICE connection show | awk -F: -v d="$VPN_IF" '$2==d {print $1}')
 
-        nmcli connection add type tun con-name "$NM_CON_NAME" ifname "$VPN_IF"
+        # 连接可能已存在（上次运行创建过），避免 connection add 因重复而失败退出
+        if ! nmcli connection show "$NM_CON_NAME" >/dev/null 2>&1; then
+            nmcli connection add type tun con-name "$NM_CON_NAME" ifname "$VPN_IF"
+        fi
         nmcli connection modify "$NM_CON_NAME" tun.mode tap
+        # 关键：只屏蔽 DHCP 下发的默认路由，SoftEther 下发的其他路由照常接受。
+        # 不用 ipv4.ignore-auto-routes yes —— 那会把所有自动路由都丢掉。
+        # never-default 已足以阻止 DHCP 续租（T1/T2）时把默认路由加回来。
         nmcli connection modify "$NM_CON_NAME" \
             ipv4.method auto \
             ipv4.dhcp-timeout 120 \
+            ipv4.never-default yes \
             ipv6.method disabled \
             connection.autoconnect yes \
             connection.autoconnect-retries 0
 
-        nmcli connection up "$NM_CON_NAME"
+        # 等待 DHCP 完成后再操作路由，避免 DHCP 晚于脚本完成而补写默认路由
+        if ! nmcli --wait 30 connection up "$NM_CON_NAME"; then
+            echo "错误：激活 NetworkManager 连接 $NM_CON_NAME 失败，请检查 vpncmd 是否已成功建立隧道。"
+            exit 1
+        fi
 
         echo ">>> 等待 DHCP 完成..."
         sleep 2
 
-        echo ">>> 从默认路由中提取 VPN 网关..."
-        VPN_DEFAULT_GW=$(ip route show default dev "$VPN_IF" 2>/dev/null \
-            | awk '/via/ {for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
+        echo ">>> 从 DHCP 信息中提取 VPN 网关..."
+        # 注意：设置 never-default 后，部分 NetworkManager 版本不再把 DHCP 网关
+        # 登记到 IP4.GATEWAY，因此改从 DHCP 原始选项读取。
+        # 实测：nmcli -g 输出为“单行、各项以 | 分隔”，必须先拆行再匹配，不能用行首锚定
+        VPN_DEFAULT_GW=$(nmcli -g DHCP4.OPTION device show "$VPN_IF" 2>/dev/null \
+            | tr '|' '\n' \
+            | sed -n 's/^[[:space:]]*routers[[:space:]]*=[[:space:]]*\([^[:space:]/]*\).*/\1/p' \
+            | head -n1)
+
+        # 兜底 1：从 NetworkManager / dhclient 的租约文件读取
+        if [ -z "$VPN_DEFAULT_GW" ]; then
+            VPN_DEFAULT_GW=$(grep -h -m1 'option routers' \
+                /var/lib/NetworkManager/*"$VPN_IF"*.lease \
+                /var/lib/dhcp/dhclient-"$VPN_IF".lease \
+                /var/lib/dhcp/dhclient.leases 2>/dev/null \
+                | awk '{gsub(/;/,"",$3); print $3}')
+        fi
+
+        # 兜底 2：若默认路由仍存在，直接从路由表读取
+        if [ -z "$VPN_DEFAULT_GW" ]; then
+            VPN_DEFAULT_GW=$(ip route show default dev "$VPN_IF" 2>/dev/null \
+                | awk '/via/ {for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
+        fi
+
+        # 兜底 3：以上都取不到时，临时恢复 DHCP 默认路由，从路由表取到后再重新屏蔽。
+        # 这样可兼容各类 NetworkManager 版本，无需依赖 IP4.GATEWAY 属性。
+        if [ -z "$VPN_DEFAULT_GW" ]; then
+            echo "    常规方式未取到网关，临时恢复 DHCP 默认路由后重试..."
+            nmcli connection modify "$NM_CON_NAME" \
+                ipv4.never-default no 2>/dev/null || true
+            nmcli --wait 30 connection up "$NM_CON_NAME" 2>/dev/null || true
+            sleep 2
+            VPN_DEFAULT_GW=$(ip route show default dev "$VPN_IF" 2>/dev/null \
+                | awk '/via/ {for(i=1;i<=NF;i++) if($i=="via") print $(i+1); exit}')
+            nmcli connection modify "$NM_CON_NAME" \
+                ipv4.never-default yes 2>/dev/null || true
+            nmcli --wait 30 connection up "$NM_CON_NAME" 2>/dev/null || true
+            sleep 1
+        fi
 
         if [ -z "$VPN_DEFAULT_GW" ]; then
-            echo "错误：未能从 $VPN_IF 的默认路由中提取网关地址。"
+            echo "错误：未能提取 VPN 网关地址。以下是诊断信息："
+            nmcli device show "$VPN_IF" 2>/dev/null | grep -E 'IP4|DHCP4' || true
             ip -4 addr show dev "$VPN_IF" || true
             ip route show default || true
             exit 1
         fi
         echo "    提取到 VPN 网关: $VPN_DEFAULT_GW"
 
-        echo ">>> 删除自动添加的默认路由..."
+        echo ">>> 清理可能残留的默认路由（正常情况下不应再出现）..."
         ip route del default via "$VPN_DEFAULT_GW" dev "$VPN_IF" 2>/dev/null && \
-            echo "    已删除默认路由" || echo "    未找到，跳过"
+            echo "    已删除残留默认路由" || echo "    无默认路由，跳过"
 
         echo ">>> 添加静态路由..."
         for net in "${TARGET_NET[@]}"; do
