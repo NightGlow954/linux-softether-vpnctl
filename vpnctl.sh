@@ -1,5 +1,6 @@
 #!/bin/bash
 # SoftEther VPN Client 连接/断开控制脚本
+# Version 1.0
 # 用法:
 #   ./vpn-ctl.sh                      # 列出所有账户
 #   ./vpn-ctl.sh <账户名> connect     # 连接（简写 c）
